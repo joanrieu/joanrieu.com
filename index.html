@@ -10,14 +10,36 @@
         background: black;
       }
 
-      svg {
+      .wrap {
         position: absolute;
         top: 50%;
         left: 50%;
         transform: translate(-50%, -50%);
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: center;
+        gap: 2vw;
         width: 100vw;
+      }
+
+      .wrap svg {
+        width: 45vw;
         height: auto;
-        max-height: 100vh;
+        max-width: 480px;
+        max-height: 80vh;
+      }
+
+      @media (aspect-ratio < 1) {
+        .wrap {
+          flex-direction: column;
+          gap: 4vh;
+        }
+
+        .wrap svg {
+          width: 80vw;
+          max-width: none;
+        }
       }
 
       a {
@@ -66,61 +88,73 @@
     <h1>Joan Rieu</h1>
     <a href="https://www.linkedin.com/in/joanrieu/">Hire me &rarr;</a>
     <script>
-      const art = `
-        _________#______________________________####____#___####__#____#____
-        _________#___####____#####__#####_______#___#___#__#______#____#____
-        _________#__#____#__#____#__#____#______####____#__####___#____#____
-        ____#____#__#____#__#____#__#____#______#___#___#__#______#____#____
-        _____####____####____#####__#____#______#____#__#___####___####_____
-      `;
+      const art = [
+        `_____#________________________
+         _____#___####____#####__#####_
+         _____#__#____#__#____#__#____#
+         #____#__#____#__#____#__#____#
+         _####____####____#####__#____#`,
+        `####____#___####__#____#
+         #___#___#__#______#____#
+         ####____#__####___#____#
+         #___#___#__#______#____#
+         #____#__#___####___####_`,
+      ];
       const cell = 10;
-      const rows = art
-        .trim()
-        .split("\n")
-        .map((r) => r.trim());
-      const cols = Math.max(...rows.map((r) => r.length));
       const ns = "http://www.w3.org/2000/svg";
       const pad = cell * 2;
-      const svg = document.createElementNS(ns, "svg");
-      svg.setAttribute("aria-label", "Joan Rieu");
-      svg.setAttribute(
-        "viewBox",
-        `0 0 ${cols * cell + pad * 2} ${rows.length * cell + pad * 2}`,
-      );
-      const defs = document.createElementNS(ns, "defs");
-      const filter = document.createElementNS(ns, "filter");
-      filter.setAttribute("id", "glow");
-      filter.setAttribute("x", "-100%");
-      filter.setAttribute("y", "-100%");
-      filter.setAttribute("width", "300%");
-      filter.setAttribute("height", "300%");
-      const blur = document.createElementNS(ns, "feGaussianBlur");
-      blur.setAttribute("stdDeviation", "5");
-      filter.appendChild(blur);
-      defs.appendChild(filter);
-      svg.appendChild(defs);
+      const wrap = document.createElement("div");
+      wrap.className = "wrap";
+      wrap.setAttribute("aria-label", "Joan Rieu");
       const dots = [];
-      for (let y = 0; y < rows.length; y++) {
-        for (let x = 0; x < rows[y].length; x++) {
-          if (rows[y][x] === "#") {
-            const glow = document.createElementNS(ns, "circle");
-            glow.setAttribute("cx", x * cell + cell / 2 + pad);
-            glow.setAttribute("cy", y * cell + cell / 2 + pad);
-            glow.setAttribute("r", cell);
-            glow.setAttribute("fill", "#0bb7d1");
-            glow.setAttribute("opacity", "0");
-            glow.setAttribute("class", "glow");
-            glow.setAttribute("filter", "url(#glow)");
-            svg.appendChild(glow);
-            const circle = document.createElementNS(ns, "circle");
-            circle.setAttribute("cx", x * cell + cell / 2 + pad);
-            circle.setAttribute("cy", y * cell + cell / 2 + pad);
-            circle.setAttribute("r", cell / 3);
-            circle.setAttribute("fill", "white");
-            svg.appendChild(circle);
-            dots.push({ el: circle, glow, x, y });
+      for (const piece of art) {
+        const rows = piece
+          .trim()
+          .split("\n")
+          .map((r) => r.trim());
+        const cols = Math.max(...rows.map((r) => r.length));
+        const svg = document.createElementNS(ns, "svg");
+        svg.setAttribute(
+          "viewBox",
+          `0 0 ${cols * cell + pad * 2} ${rows.length * cell + pad * 2}`,
+        );
+        const defs = document.createElementNS(ns, "defs");
+        const filter = document.createElementNS(ns, "filter");
+        filter.setAttribute("id", "glow");
+        filter.setAttribute("x", "-100%");
+        filter.setAttribute("y", "-100%");
+        filter.setAttribute("width", "300%");
+        filter.setAttribute("height", "300%");
+        const blur = document.createElementNS(ns, "feGaussianBlur");
+        blur.setAttribute("stdDeviation", "5");
+        filter.appendChild(blur);
+        defs.appendChild(filter);
+        svg.appendChild(defs);
+        for (let y = 0; y < rows.length; y++) {
+          for (let x = 0; x < rows[y].length; x++) {
+            if (rows[y][x] === "#") {
+              const cx = x * cell + cell / 2 + pad;
+              const cy = y * cell + cell / 2 + pad;
+              const glow = document.createElementNS(ns, "circle");
+              glow.setAttribute("cx", cx);
+              glow.setAttribute("cy", cy);
+              glow.setAttribute("r", cell);
+              glow.setAttribute("fill", "#0bb7d1");
+              glow.setAttribute("opacity", "0");
+              glow.setAttribute("class", "glow");
+              glow.setAttribute("filter", "url(#glow)");
+              svg.appendChild(glow);
+              const circle = document.createElementNS(ns, "circle");
+              circle.setAttribute("cx", cx);
+              circle.setAttribute("cy", cy);
+              circle.setAttribute("r", cell / 3);
+              circle.setAttribute("fill", "white");
+              svg.appendChild(circle);
+              dots.push({ el: circle, glow, x, y });
+            }
           }
         }
+        wrap.appendChild(svg);
       }
       for (const dot of dots) {
         dot.nearest = dots
@@ -129,7 +163,7 @@
           .sort((a, b) => a.dist - b.dist)
           .map(({ d }) => d);
       }
-      document.body.appendChild(svg);
+      document.body.appendChild(wrap);
       document.querySelector("h1").remove();
 
       const ANIM_MS = 150;

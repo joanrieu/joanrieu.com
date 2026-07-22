@@ -23,11 +23,14 @@
         width: 100vw;
       }
 
+      /* layout probes: kept in flow to measure on-screen position/size,
+         but invisible and empty so nothing is drawn or clipped here */
       .wrap svg {
         width: 45vw;
         height: auto;
         max-width: 480px;
         max-height: 80vh;
+        visibility: hidden;
       }
 
       @media (aspect-ratio < 1) {
@@ -40,6 +43,16 @@
           width: 80vw;
           max-width: none;
         }
+      }
+
+      /* single full-screen canvas; 1 viewBox unit = 1 CSS pixel */
+      .overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        pointer-events: none;
       }
     </style>
   </head>
@@ -60,35 +73,272 @@
       const cell = 10;
       const ns = "http://www.w3.org/2000/svg";
       const pad = cell * 2;
+      const linksPerPoint = 3;
+      const stiffness = 0.004; // spring stiffness; smaller = slower oscillation
+      const damping = 0.976; // velocity retained per frame; closer to 1 = bouncier
+      const satScale = 25; // saturates force for large errors so the initial regroup is gentle, not a yank
+
       const wrap = document.createElement("div");
       wrap.className = "wrap";
       wrap.setAttribute("aria-label", "Joan Rieu");
+
+      // one full-screen overlay holds every circle so dots overshooting their
+      // piece's rest area are never clipped by a small per-piece viewBox
+      const overlay = document.createElementNS(ns, "svg");
+      overlay.setAttribute("class", "overlay");
+
+      const pieces = [];
+
+      const shuffle = (arr) => {
+        for (let i = arr.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+        return arr;
+      };
+
       for (const piece of art) {
         const rows = piece
           .trim()
           .split("\n")
           .map((r) => r.trim());
         const cols = Math.max(...rows.map((r) => r.length));
-        const svg = document.createElementNS(ns, "svg");
-        svg.setAttribute(
-          "viewBox",
-          `0 0 ${cols * cell + pad * 2} ${rows.length * cell + pad * 2}`,
-        );
+        const W = cols * cell + pad * 2;
+        const H = rows.length * cell + pad * 2;
+
+        // invisible layout probe: same viewBox + CSS sizing as before so its
+        // getBoundingClientRect tells us where this piece lands on screen
+        const probe = document.createElementNS(ns, "svg");
+        probe.setAttribute("viewBox", `0 0 ${W} ${H}`);
+        probe.setAttribute("aria-hidden", "true");
+
+        // collect points at their original art positions (piece-local coords)
+        const points = [];
         for (let y = 0; y < rows.length; y++) {
           for (let x = 0; x < rows[y].length; x++) {
-            if (rows[y][x] === "#") {
-              const circle = document.createElementNS(ns, "circle");
-              circle.setAttribute("cx", x * cell + cell / 2 + pad);
-              circle.setAttribute("cy", y * cell + cell / 2 + pad);
-              circle.setAttribute("r", cell / 3);
-              circle.setAttribute("fill", "white");
-              svg.appendChild(circle);
-            }
+            if (rows[y][x] !== "#") continue;
+            const px = x * cell + cell / 2 + pad;
+            const py = y * cell + cell / 2 + pad;
+            const circle = document.createElementNS(ns, "circle");
+            circle.setAttribute("fill", "white");
+            overlay.appendChild(circle);
+            points.push({
+              ox: px,
+              oy: py,
+              x: px,
+              y: py,
+              vx: 0,
+              vy: 0,
+              fx: 0,
+              fy: 0,
+              el: circle,
+            });
           }
         }
-        wrap.appendChild(svg);
+
+        // attach each point to `linksPerPoint` random peers
+        const springs = [];
+        const seen = new Set();
+        for (let i = 0; i < points.length; i++) {
+          const order = points.map((_, j) => j).filter((j) => j !== i);
+          shuffle(order);
+          let made = 0;
+          for (const j of order) {
+            if (made >= linksPerPoint) break;
+            const key = i < j ? `${i},${j}` : `${j},${i}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            made++;
+            const a = points[i];
+            const b = points[j];
+            springs.push({
+              a,
+              b,
+              rx: b.ox - a.ox, // rest vector A -> B (magnitude + ratio)
+              ry: b.oy - a.oy,
+            });
+          }
+        }
+
+        wrap.appendChild(probe);
+        pieces.push({ probe, points, springs, W, H, offsetX: 0, offsetY: 0, scale: 1 });
       }
       document.body.appendChild(wrap);
+      document.body.appendChild(overlay);
+
+      const allPoints = pieces.flatMap((p) => p.points);
+      const allSprings = pieces.flatMap((p) => p.springs);
+
+      // measure each probe's on-screen rect and derive the piece-local ->
+      // screen transform (matches preserveAspectRatio="xMidYMid meet").
+      function updateLayout() {
+        const iw = window.innerWidth;
+        const ih = window.innerHeight;
+        overlay.setAttribute("viewBox", `0 0 ${iw} ${ih}`);
+        for (const piece of pieces) {
+          const r = piece.probe.getBoundingClientRect();
+          // meet: content scaled to fit, centered in the CSS box
+          const scale = Math.min(r.width / piece.W, r.height / piece.H);
+          const contentW = piece.W * scale;
+          const contentH = piece.H * scale;
+          piece.offsetX = r.left + (r.width - contentW) / 2;
+          piece.offsetY = r.top + (r.height - contentH) / 2;
+          piece.scale = scale;
+          const rr = (cell / 3) * scale;
+          for (const p of piece.points) p.el.setAttribute("r", rr);
+        }
+      }
+      window.addEventListener("resize", updateLayout);
+      // layout needs one frame after append before rects are reliable
+      requestAnimationFrame(() => {
+        updateLayout();
+        requestAnimationFrame(loop);
+      });
+
+      // displace every point to a random spot inside its piece-local viewBox
+      function spreadOut() {
+        for (const piece of pieces) {
+          for (const p of piece.points) {
+            p.sx = p.x;
+            p.sy = p.y;
+            p.tx = Math.random() * piece.W;
+            p.ty = Math.random() * piece.H;
+            p.vx = 0;
+            p.vy = 0;
+          }
+        }
+      }
+
+      // one step of spring-mass integration: vector springs pull each pair's
+      // relative position toward its rest vector; underdamped (damping < 1)
+      // so points overshoot and bounce into place. Centroid is pinned per piece
+      // to absorb the free translation mode springs can't see.
+      function relaxStep() {
+        // zero forces
+        for (const p of allPoints) {
+          p.fx = 0;
+          p.fy = 0;
+        }
+        // vector springs: target relative position = rest vector (rx, ry)
+        for (const s of allSprings) {
+          let ex = s.b.x - s.a.x - s.rx;
+          let ey = s.b.y - s.a.y - s.ry;
+          // soft saturation: big errors -> ~constant force (gentle ramp)
+          // small errors -> linear spring (precise bouncy settle)
+          ex = ex / (1 + Math.abs(ex) / satScale);
+          ey = ey / (1 + Math.abs(ey) / satScale);
+          const fx = stiffness * ex;
+          const fy = stiffness * ey;
+          s.a.fx += fx;
+          s.a.fy += fy;
+          s.b.fx -= fx;
+          s.b.fy -= fy;
+        }
+        // integrate velocity (with damping) + position
+        for (const p of allPoints) {
+          p.vx = (p.vx + p.fx) * damping;
+          p.vy = (p.vy + p.fy) * damping;
+          p.x += p.vx;
+          p.y += p.vy;
+        }
+        // springs are translation-invariant, so pin each piece's centroid
+        // (position AND velocity) to its original spot -> kills drift without
+        // touching internal oscillation
+        for (const piece of pieces) {
+          const n = piece.points.length;
+          if (!n) continue;
+          let cx = 0,
+            cy = 0,
+            vcx = 0,
+            vcy = 0,
+            ocx = 0,
+            ocy = 0;
+          for (const p of piece.points) {
+            cx += p.x;
+            cy += p.y;
+            vcx += p.vx;
+            vcy += p.vy;
+            ocx += p.ox;
+            ocy += p.oy;
+          }
+          const dx = ocx / n - cx / n;
+          const dy = ocy / n - cy / n;
+          const dvx = -vcx / n;
+          const dvy = -vcy / n;
+          for (const p of piece.points) {
+            p.x += dx;
+            p.y += dy;
+            p.vx += dvx;
+            p.vy += dvy;
+          }
+        }
+        // how far is the worst point from its rest position?
+        let maxErr = 0;
+        for (const p of allPoints) {
+          const d = Math.abs(p.x - p.ox) + Math.abs(p.y - p.oy);
+          if (d > maxErr) maxErr = d;
+        }
+        return maxErr;
+      }
+
+      // map piece-local coords -> overlay screen coords via each piece's
+      // measured transform; radius is scaled too, so rest size is preserved
+      function render() {
+        for (const piece of pieces) {
+          const { offsetX, offsetY, scale } = piece;
+          for (const p of piece.points) {
+            p.el.setAttribute("cx", offsetX + p.x * scale);
+            p.el.setAttribute("cy", offsetY + p.y * scale);
+          }
+        }
+      }
+
+      // phases: art (hold) -> spread -> relax -> loop
+      let phase = "art";
+      let phaseStart = 0;
+      const timings = { art: 800, spread: 1200, relax: 4000 };
+      const settleThreshold = 0.4; // max point-to-rest error (px) to count as settled
+      const relaxMax = 8000; // hard fallback so a stuck system can't hang
+
+      function loop(t) {
+        if (!phaseStart) phaseStart = t;
+        const e = t - phaseStart;
+
+        if (phase === "art") {
+          for (const p of allPoints) {
+            p.x = p.ox;
+            p.y = p.oy;
+            p.vx = 0;
+            p.vy = 0;
+          }
+          if (e > timings.art) {
+            phase = "spread";
+            phaseStart = t;
+            spreadOut();
+          }
+        } else if (phase === "spread") {
+          const u = Math.min(1, e / timings.spread);
+          for (const p of allPoints) {
+            p.x = p.sx + (p.tx - p.sx) * u;
+            p.y = p.sy + (p.ty - p.sy) * u;
+          }
+          if (e > timings.spread) {
+            phase = "relax";
+            phaseStart = t;
+          }
+        } else if (phase === "relax") {
+          const err = relaxStep();
+          // only move on once the springs have actually settled (sub-pixel),
+          // or the fallback timer runs out — no more timer-driven snap.
+          if ((e > timings.relax && err < settleThreshold) || e > relaxMax) {
+            phase = "art";
+            phaseStart = t;
+          }
+        }
+
+        render();
+        requestAnimationFrame(loop);
+      }
     </script>
   </body>
 </html>

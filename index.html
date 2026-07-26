@@ -74,8 +74,9 @@
       const ns = "http://www.w3.org/2000/svg";
       const pad = cell * 2;
       const linksPerPoint = 3;
-      const stiffness = 0.004; // spring stiffness; smaller = slower oscillation
-      const damping = 0.976; // velocity retained per frame; closer to 1 = bouncier
+      const stiffness = 0.008; // spring stiffness; smaller = slower oscillation
+      const dampingStart = 0.974; // early relax: bouncy underdamped
+      const dampingEnd = 0.86; // late relax: heavy, kills residual wobble
       const satScale = 25; // saturates force for large errors so the initial regroup is gentle, not a yank
 
       const wrap = document.createElement("div");
@@ -213,7 +214,7 @@
       // relative position toward its rest vector; underdamped (damping < 1)
       // so points overshoot and bounce into place. Centroid is pinned per piece
       // to absorb the free translation mode springs can't see.
-      function relaxStep() {
+      function relaxStep(damp) {
         // zero forces
         for (const p of allPoints) {
           p.fx = 0;
@@ -236,8 +237,8 @@
         }
         // integrate velocity (with damping) + position
         for (const p of allPoints) {
-          p.vx = (p.vx + p.fx) * damping;
-          p.vy = (p.vy + p.fy) * damping;
+          p.vx = (p.vx + p.fx) * damp;
+          p.vy = (p.vy + p.fy) * damp;
           p.x += p.vx;
           p.y += p.vy;
         }
@@ -272,13 +273,18 @@
             p.vy += dvy;
           }
         }
-        // how far is the worst point from its rest position?
+        // how far is the worst point from rest, and how fast is it moving?
+        // both must be small: a point mid-bounce passes through rest with
+        // ~peak velocity, so position alone would false-trigger the exit.
         let maxErr = 0;
+        let maxVel = 0;
         for (const p of allPoints) {
           const d = Math.abs(p.x - p.ox) + Math.abs(p.y - p.oy);
           if (d > maxErr) maxErr = d;
+          const v = Math.abs(p.vx) + Math.abs(p.vy);
+          if (v > maxVel) maxVel = v;
         }
-        return maxErr;
+        return { err: maxErr, vel: maxVel };
       }
 
       // map piece-local coords -> overlay screen coords via each piece's
@@ -296,9 +302,10 @@
       // phases: art (hold) -> spread -> relax -> loop
       let phase = "art";
       let phaseStart = 0;
-      const timings = { art: 800, spread: 1200, relax: 4000 };
-      const settleThreshold = 0.4; // max point-to-rest error (px) to count as settled
-      const relaxMax = 8000; // hard fallback so a stuck system can't hang
+      const timings = { art: 800, spread: 1200, relax: 2500, ramp: 2500 };
+      const settleThreshold = 1.0; // max point-to-rest error (px) to count as settled
+      const velThreshold = 0.08; // max point speed (px/frame) to count as settled
+      const relaxMax = 6000; // hard fallback so a stuck system can't hang
 
       function loop(t) {
         if (!phaseStart) phaseStart = t;
@@ -318,19 +325,36 @@
           }
         } else if (phase === "spread") {
           const u = Math.min(1, e / timings.spread);
+          // easeInOut: zero slope at both ends, so velocity tapers to 0 as
+          // points arrive at their scattered spots — no hard dv/dt cutoff
+          const v = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
           for (const p of allPoints) {
-            p.x = p.sx + (p.tx - p.sx) * u;
-            p.y = p.sy + (p.ty - p.sy) * u;
+            p.x = p.sx + (p.tx - p.sx) * v;
+            p.y = p.sy + (p.ty - p.sy) * v;
           }
           if (e > timings.spread) {
+            // hand off the spread velocity into p.vx/vy so relax starts with
+            // continuous momentum instead of re-accelerating from zero
+            const dv = 1 / Math.max(1, timings.spread);
+            for (const p of allPoints) {
+              p.vx = (p.tx - p.sx) * dv;
+              p.vy = (p.ty - p.sy) * dv;
+            }
             phase = "relax";
             phaseStart = t;
           }
         } else if (phase === "relax") {
-          const err = relaxStep();
-          // only move on once the springs have actually settled (sub-pixel),
-          // or the fallback timer runs out — no more timer-driven snap.
-          if ((e > timings.relax && err < settleThreshold) || e > relaxMax) {
+          // ramp damping from bouncy (start) to heavy (end) so the wobble dies
+          // out gracefully by `timings.ramp` instead of being hard-cut
+          const u = Math.min(1, e / timings.ramp);
+          const damp = dampingStart + (dampingEnd - dampingStart) * u;
+          const { err, vel } = relaxStep(damp);
+          // only move on once the springs have actually settled — both position
+          // AND velocity small (position alone false-triggers mid-bounce).
+          if (
+            (e > timings.relax && err < settleThreshold && vel < velThreshold) ||
+            e > relaxMax
+          ) {
             phase = "art";
             phaseStart = t;
           }

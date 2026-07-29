@@ -82,7 +82,6 @@
       const dampingStart = 0.974; // early relax: bouncy underdamped
       const dampingEnd = 0.86; // late relax: heavy, kills residual wobble
       const homeStrength = 0.05; // Hooke pull of each point toward its own rest position; pins translation+orientation reliably (distance-scaling extracts from tangles)
-      const impulse = 11; // initial random velocity (px/frame) that disperses points outward from rest; the sim then gathers them back
 
       const wrap = document.createElement("div");
       wrap.className = "wrap";
@@ -234,15 +233,21 @@
         return e < settleErr && v < settleVel;
       }
 
-      // dispersion = initial conditions for the same sim: kick each point from
-      // rest with a random velocity; springs+home pull+drag gather it back.
+      // dispersion = initial conditions for the same sim: derange the points so
+      // each instantly sits at a different point's rest spot, then springs+home
+      // pull+drag sort them back. A single cyclic reassign of a shuffled order
+      // is a guaranteed derangement (no point keeps its own spot).
       function kick() {
         kickAt = performance.now();
-        for (const p of allPoints) {
-          const a = Math.random() * Math.PI * 2;
-          const m = impulse * (0.5 + Math.random() * 0.5);
-          p.vx = Math.cos(a) * m;
-          p.vy = Math.sin(a) * m;
+        const order = shuffle(allPoints.slice());
+        const n = order.length;
+        for (let i = 0; i < n; i++) {
+          const dst = order[i];
+          const src = order[(i + 1) % n];
+          dst.x = src.ox;
+          dst.y = src.oy;
+          dst.vx = 0;
+          dst.vy = 0;
         }
       }
 

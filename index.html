@@ -214,7 +214,7 @@
       // relative position toward its rest vector; underdamped (damping < 1)
       // so points overshoot and bounce into place. Centroid is pinned per piece
       // to absorb the free translation mode springs can't see.
-      function relaxStep(damp) {
+      function relaxStep(damp, u) {
         // zero forces
         for (const p of allPoints) {
           p.fx = 0;
@@ -242,35 +242,36 @@
           p.x += p.vx;
           p.y += p.vy;
         }
-        // springs are translation-invariant, so pin each piece's centroid
-        // (position AND velocity) to its original spot -> kills drift without
-        // touching internal oscillation
+        // springs are translation-invariant, so the absolute position is a
+        // free mode. Glide each piece's centroid from where the scatter left
+        // it (piece.rcStartX/Y) to its original spot over the relax window
+        // via smoothstep — frame 1 has ~zero shift (no snap), and the centroid
+        // arrives home smoothly. Internal spring oscillation is untouched.
+        const s = u * u * (3 - 2 * u); // smoothstep
         for (const piece of pieces) {
           const n = piece.points.length;
           if (!n) continue;
           let cx = 0,
             cy = 0,
-            vcx = 0,
-            vcy = 0,
             ocx = 0,
             ocy = 0;
           for (const p of piece.points) {
             cx += p.x;
             cy += p.y;
-            vcx += p.vx;
-            vcy += p.vy;
             ocx += p.ox;
             ocy += p.oy;
           }
-          const dx = ocx / n - cx / n;
-          const dy = ocy / n - cy / n;
-          const dvx = -vcx / n;
-          const dvy = -vcy / n;
+          cx /= n;
+          cy /= n;
+          const ocxF = ocx / n;
+          const ocyF = ocy / n;
+          const desiredX = piece.rcStartX + (ocxF - piece.rcStartX) * s;
+          const desiredY = piece.rcStartY + (ocyF - piece.rcStartY) * s;
+          const dx = desiredX - cx;
+          const dy = desiredY - cy;
           for (const p of piece.points) {
             p.x += dx;
             p.y += dy;
-            p.vx += dvx;
-            p.vy += dvy;
           }
         }
         // how far is the worst point from rest, and how fast is it moving?
@@ -329,16 +330,28 @@
           // points arrive at their scattered spots — no hard dv/dt cutoff
           const v = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
           for (const p of allPoints) {
-            p.x = p.sx + (p.tx - p.sx) * v;
-            p.y = p.sy + (p.ty - p.sy) * v;
+            const nx = p.sx + (p.tx - p.sx) * v;
+            const ny = p.sy + (p.ty - p.sy) * v;
+            // record the ACTUAL per-frame displacement as velocity so the
+            // handoff into relax is continuous regardless of easing or fps
+            // (no formula-derived velocity that mismatches the motion)
+            p.vx = nx - p.x;
+            p.vy = ny - p.y;
+            p.x = nx;
+            p.y = ny;
           }
           if (e > timings.spread) {
-            // hand off the spread velocity into p.vx/vy so relax starts with
-            // continuous momentum instead of re-accelerating from zero
-            const dv = 1 / Math.max(1, timings.spread);
-            for (const p of allPoints) {
-              p.vx = (p.tx - p.sx) * dv;
-              p.vy = (p.ty - p.sy) * dv;
+            // record where the scatter left each piece's centroid so relax
+            // can glide it home from there (no frame-1 snap)
+            for (const piece of pieces) {
+              let cx = 0,
+                cy = 0;
+              for (const p of piece.points) {
+                cx += p.x;
+                cy += p.y;
+              }
+              piece.rcStartX = cx / piece.points.length;
+              piece.rcStartY = cy / piece.points.length;
             }
             phase = "relax";
             phaseStart = t;
@@ -348,7 +361,8 @@
           // out gracefully by `timings.ramp` instead of being hard-cut
           const u = Math.min(1, e / timings.ramp);
           const damp = dampingStart + (dampingEnd - dampingStart) * u;
-          const { err, vel } = relaxStep(damp);
+          const rU = Math.min(1, e / timings.relax);
+          const { err, vel } = relaxStep(damp, rU);
           // only move on once the springs have actually settled — both position
           // AND velocity small (position alone false-triggers mid-bounce).
           if (

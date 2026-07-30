@@ -81,7 +81,8 @@
       const linksPerPoint = 3;
       const homeStrength = 0.12; // linear coefficient of the (saturated) home pull near rest; must exceed springStrength so home is the dominant locator
       const homeSat = 30; // px; saturates the home pull for large errors so a wide scatter gathers gracefully instead of yanking
-      const springStrength = 0.04; // weak: keeps points coupled during gather but can't hold them off-home (home dominates near rest)
+      const springStrength = 0.04; // initial coupling; ramps down to 0 so points end pulled only to their own home (no off-home stall)
+      const springFade = 4000; // ms over which the spring strength fades to 0
 
       const wrap = document.createElement("div");
       wrap.className = "wrap";
@@ -203,11 +204,13 @@
       // when settled.
       const drag = 0.9; // velocity retained per tick; lower = damped sooner
 
+      let startAt = 0; // performance.now() of sim start; drives the spring fade
+
       const sim = forceSimulation(allPoints).stop();
       sim.velocityDecay(0); // our drag force is the sole velocity damping
       sim.alphaDecay(0); // constant alpha: the sim ticks until we stop it
 
-      sim.force("spring", forceLink(allSprings).distance((l) => l.L).strength(springStrength));
+      sim.force("spring", forceLink(allSprings).distance((l) => l.L).strength(() => springStrength * Math.max(0, 1 - (performance.now() - startAt) / springFade)));
       sim.force("home", () => {
         for (const p of allPoints) {
           // saturate: big error -> ~constant force (no yank); small -> linear
@@ -281,6 +284,7 @@
       requestAnimationFrame(() => {
         updateLayout();
         scatter();
+        startAt = performance.now();
         sim.restart();
       });
     </script>

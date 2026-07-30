@@ -61,7 +61,7 @@
   </head>
   <body>
     <script type="module">
-      import { forceSimulation, forceLink, forceX, forceY } from "d3-force";
+      import { forceSimulation, forceLink } from "d3-force";
 
       const art = [
         `_____#________________________
@@ -79,9 +79,9 @@
       const ns = "http://www.w3.org/2000/svg";
       const pad = cell * 2;
       const linksPerPoint = 3;
-      const dampingStart = 0.974; // early relax: bouncy underdamped
-      const dampingEnd = 0.86; // late relax: heavy, kills residual wobble
-      const homeStrength = 0.05; // Hooke pull of each point toward its own rest position; pins translation+orientation reliably (distance-scaling extracts from tangles)
+      const homeStrength = 0.12; // linear coefficient of the (saturated) home pull near rest; must exceed springStrength so home is the dominant locator
+      const homeSat = 30; // px; saturates the home pull for large errors so a wide scatter gathers gracefully instead of yanking
+      const springStrength = 0.04; // weak: keeps points coupled during gather but can't hold them off-home (home dominates near rest)
 
       const wrap = document.createElement("div");
       wrap.className = "wrap";
@@ -194,35 +194,37 @@
       window.addEventListener("resize", updateLayout);
 
       // ---- d3-force simulation ------------------------------------------------
-      // One continuous sim. structural forceLink pulls point-pairs to their
-      // rest length; forceX/forceY Hooke-pull each point to its own home
-      // (pins translation+orientation reliably — the pull scales with
-      // distance, so it extracts points from tangles that distance-only
-      // springs alone would settle into); a ramped drag damps it. d3's own
-      // timer drives the ticks — we render each tick and, once settled,
-      // hold briefly then kick it apart again. No phase machine.
-      let kickAt = 0; // performance.now() of the last kick; drives the drag ramp
+      // One-shot: points start scattered across the screen and converge once
+      // to form the word, then stop. forceLink couples point-pairs at their
+      // rest length; a saturated custom home pull (constant pull when far so a
+      // wide scatter gathers gracefully, linear spring when near so it closes
+      // the last px precisely) draws each point to its own slot; a constant
+      // drag damps it. d3's timer drives the ticks; we render each and stop
+      // when settled.
+      const drag = 0.9; // velocity retained per tick; lower = damped sooner
 
       const sim = forceSimulation(allPoints).stop();
       sim.velocityDecay(0); // our drag force is the sole velocity damping
-      sim.alphaDecay(0); // constant alpha: the sim ticks forever; we gate settle
+      sim.alphaDecay(0); // constant alpha: the sim ticks until we stop it
 
-      sim.force("spring", forceLink(allSprings).distance((l) => l.L));
-      sim.force("homeX", forceX((d) => d.ox).strength(homeStrength));
-      sim.force("homeY", forceY((d) => d.oy).strength(homeStrength));
-      sim.force("drag", () => {
-        // bouncy early, heavy late so residual wobble dies out gracefully
-        const u = Math.min(1, (performance.now() - kickAt) / ramp);
-        const damp = dampingStart + (dampingEnd - dampingStart) * u;
+      sim.force("spring", forceLink(allSprings).distance((l) => l.L).strength(springStrength));
+      sim.force("home", () => {
         for (const p of allPoints) {
-          p.vx *= damp;
-          p.vy *= damp;
+          // saturate: big error -> ~constant force (no yank); small -> linear
+          const ex = (p.ox - p.x) / (1 + Math.abs(p.ox - p.x) / homeSat);
+          const ey = (p.oy - p.y) / (1 + Math.abs(p.oy - p.y) / homeSat);
+          p.vx += homeStrength * ex;
+          p.vy += homeStrength * ey;
+        }
+      });
+      sim.force("drag", () => {
+        for (const p of allPoints) {
+          p.vx *= drag;
+          p.vy *= drag;
         }
       });
 
-      // settled when the worst point is both close to rest and slow: a point
-      // mid-bounce passes through rest with ~peak speed, so position alone
-      // would false-trigger a re-kick.
+      // settled when the worst point is both close to rest and slow.
       function settled() {
         let e = 0;
         let v = 0;
@@ -233,21 +235,19 @@
         return e < settleErr && v < settleVel;
       }
 
-      // dispersion = initial conditions for the same sim: derange the points so
-      // each instantly sits at a different point's rest spot, then springs+home
-      // pull+drag sort them back. A single cyclic reassign of a shuffled order
-      // is a guaranteed derangement (no point keeps its own spot).
-      function kick() {
-        kickAt = performance.now();
-        const order = shuffle(allPoints.slice());
-        const n = order.length;
-        for (let i = 0; i < n; i++) {
-          const dst = order[i];
-          const src = order[(i + 1) % n];
-          dst.x = src.ox;
-          dst.y = src.oy;
-          dst.vx = 0;
-          dst.vy = 0;
+      // scatter each point to a random screen position (mapped back to its
+      // piece-local coords) — the "super spread apart" start.
+      function scatter() {
+        const iw = window.innerWidth;
+        const ih = window.innerHeight;
+        for (const piece of pieces) {
+          const { offsetX, offsetY, scale } = piece;
+          for (const p of piece.points) {
+            p.x = (Math.random() * iw - offsetX) / scale;
+            p.y = (Math.random() * ih - offsetY) / scale;
+            p.vx = 0;
+            p.vy = 0;
+          }
         }
       }
 
@@ -263,30 +263,24 @@
         }
       }
 
-      const ramp = 2500; // ms for the drag ramp bouncy -> heavy
-      const hold = 800; // ms to show the settled figure before re-kicking
-      const settleErr = 1.0; // max point-to-rest error (px) to count as settled
-      const settleVel = 0.08; // max point speed (px/frame) to count as settled
-      const cycleMax = 6000; // fallback: re-kick if it ever stalls this long
-      let settledAt = Infinity; // when the sim first reached rest this cycle
+      const settleErr = 0.5; // max point-to-rest error (px) to count as settled
+      const settleVel = 0.03; // max point speed (px/frame) to count as settled
+      const settleHold = 12; // settled() must hold this many consecutive ticks before stopping, so a momentary reading can't freeze it early
+      let settleTicks = 0;
 
       sim.on("tick", () => {
         render();
-        const now = performance.now();
         if (settled()) {
-          if (settledAt === Infinity) settledAt = now;
-          if (now - settledAt > hold) kick(); // hold the word, then burst again
-        } else if (now - kickAt > cycleMax) {
-          kick(); // never settle-stall the cycle
+          if (++settleTicks >= settleHold) sim.stop();
         } else {
-          settledAt = Infinity;
+          settleTicks = 0;
         }
       });
 
       // layout needs one frame after append before rects are reliable
       requestAnimationFrame(() => {
         updateLayout();
-        kickAt = performance.now();
+        scatter();
         sim.restart();
       });
     </script>

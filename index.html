@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Joan Rieu</title>
     <script type="importmap">
-      { "imports": { "d3-force": "https://esm.sh/d3-force@3" } }
+      { "imports": { "d3": "https://esm.sh/d3@7" } }
     </script>
     <style>
       html {
@@ -61,7 +61,7 @@
   </head>
   <body>
     <script type="module">
-      import { forceSimulation, forceLink } from "d3-force";
+      import * as d3 from "d3";
 
       const art = [
         `_____#________________________
@@ -76,199 +76,156 @@
          #____#__#___####___####_`,
       ];
       const cell = 10;
-      const ns = "http://www.w3.org/2000/svg";
       const pad = cell * 2;
       const linksPerPoint = 3;
-      const homeStrength = 0.12; // linear coefficient of the (saturated) home pull near rest; must exceed springStrength so home is the dominant locator
-      const homeSat = 30; // px; saturates the home pull for large errors so a wide scatter gathers gracefully instead of yanking
-      const springStrength = 0.04; // initial coupling; ramps down to 0 so points end pulled only to their own home (no off-home stall)
-      const springFade = 4000; // ms over which the spring strength fades to 0
+      const homeStrength = 0.005; // forceX/forceY Hooke strength toward each point's home; low so a screen-wide scatter doesn't yank (no saturation now)
+      const springStrength = 0.003; // initial coupling (fades to 0); kept below homeStrength so home dominates near rest -> no off-home stall
+      const springFade = 2500; // ms over which the spring strength fades to 0
+      const velocityDecay = 0.05; // d3 velocityDecay: velocity retained = 1 - this; low = bouncy (compensates for the weaker linear pull)
+      const settleErr = 0.5; // max point-to-rest error (px) to count as settled
+      const settleVel = 0.03; // max point speed (px/frame) to count as settled
+      const settleHold = 12; // settled() must hold this many consecutive ticks before stopping, so a momentary reading can't freeze it early
+      const fadeIn = 1500; // ms for the dots to fade in over the start of the gather
 
-      const wrap = document.createElement("div");
-      wrap.className = "wrap";
-      wrap.setAttribute("aria-label", "Joan Rieu");
+      const wrap = d3.select("body").attr("aria-label", "Joan Rieu").append("div").attr("class", "wrap");
+      // start hidden so the circles (created with no cx/cy yet) never flash
+      // at (0,0) before scatter + the first render position them
+      const overlay = d3
+        .select("body")
+        .append("svg")
+        .attr("class", "overlay")
+        .attr("opacity", 0);
 
-      // one full-screen overlay holds every circle so dots overshooting their
-      // piece's rest area are never clipped by a small per-piece viewBox
-      const overlay = document.createElementNS(ns, "svg");
-      overlay.setAttribute("class", "overlay");
-
-      const pieces = [];
-
-      const shuffle = (arr) => {
-        for (let i = arr.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [arr[i], arr[j]] = [arr[j], arr[i]];
-        }
-        return arr;
-      };
-
-      for (const piece of art) {
+      const pieces = art.map((piece) => {
         const rows = piece
           .trim()
           .split("\n")
           .map((r) => r.trim());
-        const cols = Math.max(...rows.map((r) => r.length));
+        const cols = d3.max(rows, (r) => r.length);
         const W = cols * cell + pad * 2;
         const H = rows.length * cell + pad * 2;
 
-        // invisible layout probe: same viewBox + CSS sizing as before so its
-        // getBoundingClientRect tells us where this piece lands on screen
-        const probe = document.createElementNS(ns, "svg");
-        probe.setAttribute("viewBox", `0 0 ${W} ${H}`);
-        probe.setAttribute("aria-hidden", "true");
+        // invisible layout probe: same viewBox + CSS sizing so its rect tells
+        // us where this piece lands on screen
+        const probe = wrap.append("svg").attr("viewBox", `0 0 ${W} ${H}`);
 
-        // collect points at their original art positions (piece-local coords).
-        // each point IS a d3-force node: d3 will add/manage x,y,vx,vy on it.
-        const points = [];
-        for (let y = 0; y < rows.length; y++) {
-          for (let x = 0; x < rows[y].length; x++) {
-            if (rows[y][x] !== "#") continue;
-            const px = x * cell + cell / 2 + pad;
-            const py = y * cell + cell / 2 + pad;
-            const circle = document.createElementNS(ns, "circle");
-            circle.setAttribute("fill", "white");
-            overlay.appendChild(circle);
-            points.push({
-              ox: px,
-              oy: py,
-              x: px,
-              y: py,
-              vx: 0,
-              vy: 0,
-              el: circle,
-            });
-          }
-        }
+        // collect points at their original art positions (piece-local coords),
+        // declaratively via d3.range. Each point IS a d3-force node.
+        const points = d3
+          .range(rows.length)
+          .flatMap((y) =>
+            d3
+              .range(rows[y].length)
+              .filter((x) => rows[y][x] === "#")
+              .map((x) => ({
+                ox: x * cell + cell / 2 + pad,
+                oy: y * cell + cell / 2 + pad,
+                x: 0,
+                y: 0,
+                vx: 0,
+                vy: 0,
+              })),
+          );
 
-        // attach each point to `linksPerPoint` random peers
-        const springs = [];
-        const seen = new Set();
-        for (let i = 0; i < points.length; i++) {
-          const order = points.map((_, j) => j).filter((j) => j !== i);
-          shuffle(order);
-          let made = 0;
-          for (const j of order) {
-            if (made >= linksPerPoint) break;
-            const key = i < j ? `${i},${j}` : `${j},${i}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            made++;
-            const a = points[i];
-            const b = points[j];
-            springs.push({
-              source: a,
-              target: b,
-              L: Math.hypot(b.ox - a.ox, b.oy - a.oy), // rest length (distance-only)
-            });
-          }
-        }
+        // each point links to `linksPerPoint` random peers — fully
+        // declarative via d3.range + d3.shuffle + slice. Duplicate undirected
+        // edges (a pair picked from both ends) can occur; forceLink tolerates
+        // them (just 2x stiffness on that pair) and they're rare, so no dedup.
+        const springs = d3.range(points.length).flatMap((i) =>
+          d3
+            .shuffle(d3.range(points.length).filter((j) => j !== i))
+            .slice(0, linksPerPoint)
+            .map((j) => ({
+              source: points[i],
+              target: points[j],
+              L: Math.hypot(points[j].ox - points[i].ox, points[j].oy - points[i].oy),
+            })),
+        );
 
-        wrap.appendChild(probe);
-        pieces.push({ probe, points, springs, W, H, offsetX: 0, offsetY: 0, scale: 1 });
-      }
-      document.body.appendChild(wrap);
-      document.body.appendChild(overlay);
+        return { probe, points, springs, W, H, offsetX: 0, offsetY: 0, scale: 1 };
+      });
 
       const allPoints = pieces.flatMap((p) => p.points);
       const allSprings = pieces.flatMap((p) => p.springs);
 
-      // measure each probe's on-screen rect and derive the piece-local ->
-      // screen transform (matches preserveAspectRatio="xMidYMid meet").
+      // nested data-join: one <g> per piece carrying its screen transform,
+      // with circles inside in piece-local coords. The transform maps local ->
+      // screen, so render updates only cx/cy and resize touches only the
+      // transform (no manual offset/scale math, no per-resize radius scaling).
+      const pieceG = overlay.selectAll("g").data(pieces).join("g");
+      const circles = pieceG
+        .selectAll("circle")
+        .data((d) => d.points)
+        .join("circle")
+        .attr("fill", "white")
+        .attr("r", cell / 3);
+
+      // measure each probe's on-screen rect and set its group's transform
+      // (matches preserveAspectRatio="xMidYMid meet").
       function updateLayout() {
-        const iw = window.innerWidth;
-        const ih = window.innerHeight;
-        overlay.setAttribute("viewBox", `0 0 ${iw} ${ih}`);
-        for (const piece of pieces) {
-          const r = piece.probe.getBoundingClientRect();
-          // meet: content scaled to fit, centered in the CSS box
-          const scale = Math.min(r.width / piece.W, r.height / piece.H);
-          const contentW = piece.W * scale;
-          const contentH = piece.H * scale;
-          piece.offsetX = r.left + (r.width - contentW) / 2;
-          piece.offsetY = r.top + (r.height - contentH) / 2;
-          piece.scale = scale;
-          const rr = (cell / 3) * scale;
-          for (const p of piece.points) p.el.setAttribute("r", rr);
-        }
+        overlay.attr("viewBox", `0 0 ${window.innerWidth} ${window.innerHeight}`);
+        pieceG.each((d) => {
+          const r = d.probe.node().getBoundingClientRect();
+          d.scale = Math.min(r.width / d.W, r.height / d.H);
+          d.offsetX = r.left + (r.width - d.W * d.scale) / 2;
+          d.offsetY = r.top + (r.height - d.H * d.scale) / 2;
+        });
+        pieceG.attr("transform", (d) => `translate(${d.offsetX},${d.offsetY}) scale(${d.scale})`);
       }
-      window.addEventListener("resize", updateLayout);
+      d3.select(window).on("resize", updateLayout);
 
       // ---- d3-force simulation ------------------------------------------------
       // One-shot: points start scattered across the screen and converge once
       // to form the word, then stop. forceLink couples point-pairs at their
-      // rest length; a saturated custom home pull (constant pull when far so a
-      // wide scatter gathers gracefully, linear spring when near so it closes
-      // the last px precisely) draws each point to its own slot; a constant
-      // drag damps it. d3's timer drives the ticks; we render each and stop
-      // when settled.
-      const drag = 0.9; // velocity retained per tick; lower = damped sooner
-
+      // rest length (fading to 0); forceX/forceY Hooke-pull each point to its
+      // own home; d3's built-in velocityDecay damps it. d3's timer drives the
+      // ticks; we render each and stop when settled.
       let startAt = 0; // performance.now() of sim start; drives the spring fade
 
-      const sim = forceSimulation(allPoints).stop();
-      sim.velocityDecay(0); // our drag force is the sole velocity damping
+      const sim = d3.forceSimulation(allPoints).stop();
+      sim.velocityDecay(velocityDecay); // built-in damping (replaces a custom drag force)
       sim.alphaDecay(0); // constant alpha: the sim ticks until we stop it
 
-      sim.force("spring", forceLink(allSprings).distance((l) => l.L).strength(() => springStrength * Math.max(0, 1 - (performance.now() - startAt) / springFade)));
-      sim.force("home", () => {
-        for (const p of allPoints) {
-          // saturate: big error -> ~constant force (no yank); small -> linear
-          const ex = (p.ox - p.x) / (1 + Math.abs(p.ox - p.x) / homeSat);
-          const ey = (p.oy - p.y) / (1 + Math.abs(p.oy - p.y) / homeSat);
-          p.vx += homeStrength * ex;
-          p.vy += homeStrength * ey;
-        }
-      });
-      sim.force("drag", () => {
-        for (const p of allPoints) {
-          p.vx *= drag;
-          p.vy *= drag;
-        }
-      });
+      sim.force(
+        "spring",
+        d3
+          .forceLink(allSprings)
+          .distance((l) => l.L)
+          .strength(() => springStrength * Math.max(0, 1 - (performance.now() - startAt) / springFade)),
+      );
+      // home pull via d3 built-ins (no custom force, no loop): linear Hooke
+      // toward each point's own home. No saturation, hence the low homeStrength.
+      sim.force("homeX", d3.forceX((d) => d.ox).strength(homeStrength));
+      sim.force("homeY", d3.forceY((d) => d.oy).strength(homeStrength));
 
       // settled when the worst point is both close to rest and slow.
       function settled() {
-        let e = 0;
-        let v = 0;
-        for (const p of allPoints) {
-          e = Math.max(e, Math.abs(p.x - p.ox) + Math.abs(p.y - p.oy));
-          v = Math.max(v, Math.abs(p.vx) + Math.abs(p.vy));
-        }
+        const e = d3.max(allPoints, (p) => Math.abs(p.x - p.ox) + Math.abs(p.y - p.oy));
+        const v = d3.max(allPoints, (p) => Math.abs(p.vx) + Math.abs(p.vy));
         return e < settleErr && v < settleVel;
       }
 
       // scatter each point to a random screen position (mapped back to its
-      // piece-local coords) — the "super spread apart" start.
+      // piece-local coords) — the "super spread apart" start. d3 selection.each
+      // iterates the bound circles; the piece comes from the parent <g>'s datum.
       function scatter() {
         const iw = window.innerWidth;
         const ih = window.innerHeight;
-        for (const piece of pieces) {
-          const { offsetX, offsetY, scale } = piece;
-          for (const p of piece.points) {
-            p.x = (Math.random() * iw - offsetX) / scale;
-            p.y = (Math.random() * ih - offsetY) / scale;
-            p.vx = 0;
-            p.vy = 0;
-          }
-        }
+        circles.each(function (d) {
+          const piece = d3.select(this.parentNode).datum();
+          d.x = (Math.random() * iw - piece.offsetX) / piece.scale;
+          d.y = (Math.random() * ih - piece.offsetY) / piece.scale;
+          d.vx = 0;
+          d.vy = 0;
+        });
       }
 
-      // map piece-local coords -> overlay screen coords via each piece's
-      // measured transform; radius is scaled too, so rest size is preserved
+      // circles live in piece-local coords under the group transform, so
+      // render is just cx/cy.
       function render() {
-        for (const piece of pieces) {
-          const { offsetX, offsetY, scale } = piece;
-          for (const p of piece.points) {
-            p.el.setAttribute("cx", offsetX + p.x * scale);
-            p.el.setAttribute("cy", offsetY + p.y * scale);
-          }
-        }
+        circles.attr("cx", (d) => d.x).attr("cy", (d) => d.y);
       }
 
-      const settleErr = 0.5; // max point-to-rest error (px) to count as settled
-      const settleVel = 0.03; // max point speed (px/frame) to count as settled
-      const settleHold = 12; // settled() must hold this many consecutive ticks before stopping, so a momentary reading can't freeze it early
       let settleTicks = 0;
 
       sim.on("tick", () => {
@@ -284,7 +241,10 @@
       requestAnimationFrame(() => {
         updateLayout();
         scatter();
+        render(); // position the (still invisible) dots at their scattered spots
         startAt = performance.now();
+        // now fade them in over the start of the gather
+        overlay.transition().duration(fadeIn).attr("opacity", 1);
         sim.restart();
       });
     </script>
